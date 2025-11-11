@@ -285,4 +285,183 @@ publish_dataset() {
   log "Extracting dataset to $DEST ..."
   tar -xzf "$DATA_TAR" -C "$DEST"
 
-  # Simple ind
+  # Simple index for manual check
+  INDEX="$DEST/index.html"
+  {
+    echo "<!doctype html><meta charset=\"utf-8\"><title>Dataset Index</title>"
+    echo "<h1>Dataset under $(basename "$DOCROOT")</h1><ul>"
+    find "$DEST" -type f | head -n 200 | sed -e "s|$DOCROOT||" \
+      | awk '{printf "<li><a href=\"%s\">%s</a></li>\n",$1,$1}'
+    echo "</ul>"
+  } > "$INDEX"
+}
+
+# ---------- Baseline ----------
+measure_server_baseline() {
+  LABEL="$1"
+  TS="$(date '+%Y%m%d_%H%M%S')"
+  OUT_DIR="$RESULT_DIR/$LABEL-$TS"
+  mkdir -p "$OUT_DIR"
+  URL_BASE="http://$TARGET_HOST:$PORT"
+
+  log "Baseline $LABEL small..."
+  ab_safe -n "$REQUESTS_STATIC" -c "$CONCURRENCY_STATIC" "$URL_BASE/$SMALL_FILE" | tee "$OUT_DIR/${LABEL}_small.ab.txt" >/dev/null
+
+  log "Baseline $LABEL large..."
+  ab_safe -n "$REQUESTS_LARGE" -c "$CONCURRENCY_LARGE" "$URL_BASE/$LARGE_FILE" | tee "$OUT_DIR/${LABEL}_large.ab.txt" >/dev/null
+
+  /usr/bin/curl -s -I "$URL_BASE/$SMALL_FILE" > "$OUT_DIR/${LABEL}_headers.txt" || true
+  log "Baseline done -> $OUT_DIR"
+}
+
+# ---------- Experiment setup ----------
+log "Preparing experiment files..."
+mkdir -p "$RESULT_DIR"
+prepare_docs "$APACHE_DOCROOT"
+prepare_docs "$NGINX_DOCROOT"
+
+if [ -f "$DATA_TAR" ]; then
+  publish_dataset "$APACHE_DOCROOT"
+  publish_dataset "$NGINX_DOCROOT"
+else
+  log "WARNING: Dataset tar not found at $DATA_TAR — skipping publish."
+fi
+
+tighten_perms
+
+# ---------- Packages ----------
+log "Ensuring packages..."
+ensure_pkg "$APACHE_PKG"
+ensure_pkg "$NGINX_PKG"
+
+# ---------- Apache config (hardened + MIME) ----------
+log "Configuring Apache..."
+copy_rcd_if_missing apache
+ensure_line_in_rcconf "apache=YES"
+[ -f "${APACHE_CONF}.orig" ] || cp "$APACHE_CONF" "${APACHE_CONF}.orig"
+
+# Listen on loopback
+if grep -qE '^#?\s*Listen ' "$APACHE_CONF"; then
+  sed -i -e "s|^#\?\s*Listen .*|Listen ${BIND_ADDR}:${PORT}|" "$APACHE_CONF"
+else
+  echo "Listen ${BIND_ADDR}:${PORT}" >> "$APACHE_CONF"
+fi
+
+# Run as www
+sed -i -e 's|^User .*$|User www|' -e 's|^Group .*$|Group www|' "$APACHE_CONF" || true
+
+# Docroot and directory policy
+sed -i -e "s|^DocumentRoot \".*\"|DocumentRoot \"${APACHE_DOCROOT}\"|" "$APACHE_CONF"
+if ! grep -q "<Directory \"${APACHE_DOCROOT}\">" "$APACHE_CONF"; then
+  cat >> "$APACHE_CONF" <<EOF
+
+<Directory "${APACHE_DOCROOT}">
+    Options -Indexes +FollowSymLinks
+    AllowOverride None
+    Require all granted
+    <LimitExcept GET HEAD>
+        Require all denied
+    </LimitExcept>
+</Directory>
+EOF
+else
+  sed -i -e "s|Options .*|Options -Indexes +FollowSymLinks|" "$APACHE_CONF"
+  sed -i -e "s|AllowOverride .*|AllowOverride None|" "$APACHE_CONF"
+fi
+
+# Signatures
+grep -q '^ServerTokens ' "$APACHE_CONF" && sed -i -e 's|^ServerTokens .*|ServerTokens Prod|' "$APACHE_CONF" || echo "ServerTokens Prod" >> "$APACHE_CONF"
+grep -q '^ServerSignature ' "$APACHE_CONF" && sed -i -e 's|^ServerSignature .*|ServerSignature Off|' "$APACHE_CONF" || echo "ServerSignature Off" >> "$APACHE_CONF"
+
+# Modules & MIME
+grep -q '^LoadModule headers_module' "$APACHE_CONF" || echo 'LoadModule headers_module lib/httpd/mod_headers.so' >> "$APACHE_CONF"
+grep -q '^LoadModule mime_module' "$APACHE_CONF" || echo 'LoadModule mime_module lib/httpd/mod_mime.so' >> "$APACHE_CONF"
+grep -q '^TypesConfig ' "$APACHE_CONF" || echo 'TypesConfig etc/mime.types' >> "$APACHE_CONF"
+if ! grep -q 'AddType video/mp4' "$APACHE_CONF"; then
+  cat >> "$APACHE_CONF" <<'EOF'
+AddType video/mp4 .mp4
+AddType video/webm .webm
+AddType audio/mpeg .mp3
+AddType audio/wav .wav
+EOF
+fi
+
+# Security headers
+if ! grep -q 'X-Content-Type-Options' "$APACHE_CONF"; then
+  cat >> "$APACHE_CONF" <<'EOF'
+<IfModule headers_module>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "no-referrer-when-downgrade"
+    Header always set Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    Header always set Content-Security-Policy "default-src 'self'"
+</IfModule>
+EOF
+fi
+
+# ---------- Apache run & measure ----------
+log "Starting Apache..."
+/etc/rc.d/apache restart || /etc/rc.d/apache start
+wait_port_ready "$TARGET_HOST" "$PORT"
+
+TS="$(date '+%Y%m%d_%H%M%S')"
+measure_server_baseline "apache"
+[ -d "$APACHE_DOCROOT/$DATA_SUBDIR" ] && measure_all_files "apache" "$APACHE_DOCROOT" "$TS" || true
+
+log "Stopping Apache..."
+/etc/rc.d/apache stop || true
+sleep 2
+
+# ---------- Nginx config (hardened) ----------
+log "Configuring Nginx..."
+copy_rcd_if_missing nginx
+ensure_line_in_rcconf "nginx=YES"
+[ -f "${NGINX_CONF}.orig" ] || cp "$NGINX_CONF" "${NGINX_CONF}.orig"
+
+cat > "$NGINX_CONF" <<EOF
+user  www;
+worker_processes  1;
+
+events { worker_connections 1024; }
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    sendfile      on;
+    keepalive_timeout  65;
+    server_tokens off;
+
+    server {
+        listen       ${BIND_ADDR}:${PORT};
+        server_name  localhost;
+        root ${NGINX_DOCROOT};
+        index index.html;
+
+        autoindex off;
+        location / {
+            try_files \$uri \$uri/ =404;
+            limit_except GET HEAD { deny all; }
+        }
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "no-referrer-when-downgrade" always;
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+        add_header Content-Security-Policy "default-src 'self'" always;
+    }
+}
+EOF
+
+# ---------- Nginx run & measure ----------
+log "Starting Nginx..."
+/etc/rc.d/nginx restart || /etc/rc.d/nginx start
+wait_port_ready "$TARGET_HOST" "$PORT"
+
+TS="$(date '+%Y%m%d_%H%M%S')"
+measure_server_baseline "nginx"
+[ -d "$NGINX_DOCROOT/$DATA_SUBDIR" ] && measure_all_files "nginx" "$NGINX_DOCROOT" "$TS" || true
+
+log "Stopping Nginx..."
+/etc/rc.d/nginx stop || true
+
+log "Experiment finished. Results under: $RESULT_DIR"
